@@ -56,6 +56,11 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .env.docker-lead
 .env.docker-devin
 
+# secrets-encryption key (docker-compose.example.yml / docker-compose.simple.yml
+# SECRETS_ENCRYPTION_KEY_FILE secret) — losing/leaking it loses every encrypted secret
+encryption_key
+.encryption-key
+
 # caches
 .eslintcache
 .cache
