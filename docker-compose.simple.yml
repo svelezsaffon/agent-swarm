@@ -1,0 +1,319 @@
+# Simplified Agent Swarm Docker Compose — trimmed from docker-compose.example.yml
+# for this deployment's actual usage (Bedrock harness via `pi`, GitHub, no
+# Slack/Composio/TLS yet). See SWARM-SETUP-NOTES.md for the full history of
+# why each setting below is what it is.
+#
+# What it keeps, and why (vs. the full example's 1 lead + 11 workers):
+#   - lead                 required — orchestrator
+#   - worker-1, worker-2   generic `official/coder` workers for implementation/GitHub work
+#   - worker-researcher    already has the opal_dev MCP server installed; used for
+#                          investigation-style work
+# Dropped: worker-reviewer, worker-tester, worker-forward-deployed-engineer,
+# worker-content-writer, worker-content-reviewer, worker-content-strategist,
+# worker-ux-principles, worker-discoverability-optimizer (unused this far),
+# and the optional `caddy`/TLS profile (not needed for local-only access).
+#
+# Usage:
+#   docker compose -f docker-compose.simple.yml --env-file .env up -d
+#   ./scripts/bootstrap-swarm-config.sh
+#
+# IMPORTANT: strip ambient shell AWS_PROFILE/AWS_REGION/AWS_CONFIG_FILE before
+# any `up -d` — they silently override `.env`'s values in Compose (see
+# SWARM-SETUP-NOTES.md "Fresh-deploy persistence" / troubleshooting):
+#   env -u AWS_PROFILE -u AWS_REGION -u AWS_CONFIG_FILE \
+#     docker compose -f docker-compose.simple.yml --env-file .env up -d
+
+x-agent-entrypoint: &agent-entrypoint
+  - /bin/sh
+  - -ec
+  - |
+    ID_FILE="/workspace/personal/.agent-id"
+    if [ -n "$${AGENT_ID:-}" ]; then
+      printf '%s\n' "$$AGENT_ID" > "$$ID_FILE"
+    elif [ -s "$$ID_FILE" ]; then
+      AGENT_ID=$$(cat "$$ID_FILE")
+    else
+      AGENT_ID=$$(cat /proc/sys/kernel/random/uuid)
+      printf '%s\n' "$$AGENT_ID" > "$$ID_FILE"
+    fi
+    export AGENT_ID
+    exec /docker-entrypoint.sh "$$@"
+  - --
+
+# Shared env block for every lead/worker service — anchored once instead of
+# repeated 4x, since all four services need the identical harness/model/AWS
+# config. Per-service overrides (AGENT_ID, AGENT_ROLE, TEMPLATE_ID, ports,
+# volumes) stay inline on each service below.
+x-worker-env: &worker-env
+  HARNESS_PROVIDER: ${HARNESS_PROVIDER:-claude}
+  MODEL_OVERRIDE: ${MODEL_OVERRIDE:-}
+  CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-}
+  MEMORY_RATERS: ${MEMORY_RATERS-implicit-citation,explicit-self}
+  BEDROCK_AUTH_MODE: ${BEDROCK_AUTH_MODE:-}
+  AWS_REGION: ${AWS_REGION:-}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+  AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+  AWS_PROFILE: ${AWS_PROFILE:-}
+  # pi's built-in tier defaults are openrouter/... ids; these override every
+  # tier to the verified Bedrock model so no OpenRouter key is ever needed.
+  MODEL_TIER_SMOL: ${MODEL_TIER_SMOL:-}
+  MODEL_TIER_REGULAR: ${MODEL_TIER_REGULAR:-}
+  MODEL_TIER_SMART: ${MODEL_TIER_SMART:-}
+  MODEL_TIER_ULTRA: ${MODEL_TIER_ULTRA:-}
+  # Bedrock's constrained-decoding tool grammar has a 64MB hard cap; this
+  # defers non-core swarm tools behind tool_search instead of loading all of
+  # them upfront. Required at the full 138-tool CAPABILITIES list below.
+  PI_TOOL_DEFERRAL: ${PI_TOOL_DEFERRAL:-}
+  # Code-mode: trims the external MCP surface to ~8 script tools; everything
+  # else goes through script-run + the scripts SDK. Read by workers too
+  # (src/commands/runner.ts), not just the API server.
+  SCRIPTS_ONLY_MCP: ${SCRIPTS_ONLY_MCP:-}
+  API_KEY: ${API_KEY}
+  MCP_BASE_URL: http://api:3013
+  AGENT_FS_API_URL: http://agent-fs:7433
+  BUSINESS_USE_API_KEY: ${BUSINESS_USE_API_KEY:-}
+  BUSINESS_USE_URL: ${BUSINESS_USE_URL:-}
+  YOLO: "true"
+  GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+  GITHUB_EMAIL: ${GITHUB_EMAIL:-}
+  GITHUB_NAME: ${GITHUB_NAME:-}
+  SWARM_URL: ${SWARM_URL:-localhost}
+
+services:
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - agent_fs_minio:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  minio-init:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/agentfs &&
+      mc version enable local/agentfs
+      "
+
+  agent-fs:
+    image: ghcr.io/desplega-ai/agent-fs:0.16.1
+    platform: linux/amd64
+    pull_policy: always
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      - AGENT_FS_HOME=/data
+      - HOST=0.0.0.0
+      - SERVER_HOST=0.0.0.0
+      - PORT=7433
+      - SERVER_PORT=7433
+      - S3_ENDPOINT=http://minio:9000
+      - S3_PUBLIC_ENDPOINT=${AGENT_FS_S3_PUBLIC_ENDPOINT:-${AGENT_FS_DOMAIN:+https://}${AGENT_FS_DOMAIN:-http://localhost:9000}}
+      - S3_BUCKET=agentfs
+      - S3_ACCESS_KEY_ID=minioadmin
+      - S3_SECRET_ACCESS_KEY=minioadmin
+      - S3_REGION=us-east-1
+      - S3_PROVIDER=minio
+      - EMBEDDING_PROVIDER=${AGENT_FS_EMBEDDING_PROVIDER:-local}
+      - EMBEDDING_MODEL=${AGENT_FS_EMBEDDING_MODEL:-}
+      - EMBEDDING_API_KEY=${AGENT_FS_EMBEDDING_API_KEY:-}
+    volumes:
+      - agent_fs_data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://127.0.0.1:7433/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  api:
+    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-latest}"
+    platform: linux/amd64
+    pull_policy: always
+    stop_grace_period: 60s
+    # See docker-compose.example.yml's api.pids_limit comment for the sizing
+    # rationale (issue #1332) — unchanged here.
+    pids_limit: 1024
+    depends_on:
+      agent-fs:
+        condition: service_healthy
+    environment:
+      - API_KEY=${API_KEY}
+      - RBAC_ENABLED=${RBAC_ENABLED:-true}
+      - COMPOSIO_API_KEY=${COMPOSIO_API_KEY:-}
+      - COMPOSIO_ORG_API_KEY=${COMPOSIO_ORG_API_KEY:-}
+      - COMPOSIO_BASE_URL=${COMPOSIO_BASE_URL:-}
+      # Known-working full default list + swarm-x (138 tools, verified under
+      # Bedrock's 64MB grammar cap WITH PI_TOOL_DEFERRAL=true). A trim attempt
+      # to a smaller list introduced a different failure ("Schema is too
+      # complex for compilation") — see SWARM-SETUP-NOTES.md before changing
+      # this again.
+      - CAPABILITIES=${CAPABILITIES:-core,task-pool,scripts,config,mcp,profiles,scheduling,memory,workflows,pages,metrics,kv,slack,tracker,skills,repo,swarm-x}
+      # The allowlist/scripts-only toggle replaces CAPABILITIES when set — see
+      # src/server.ts. Read here too (not just by workers in src/commands/runner.ts).
+      - SCRIPTS_ONLY_MCP=${SCRIPTS_ONLY_MCP:-}
+      - AGENT_FS_API_URL=http://agent-fs:7433
+      - API_AGENT_FS_API_KEY=${API_AGENT_FS_API_KEY:-}
+      - AGENT_FS_REGISTER_EMAIL=${AGENT_FS_REGISTER_EMAIL:-swarm-admin@agent-fs.local}
+      - SECRETS_ENCRYPTION_KEY_FILE=/run/secrets/encryption_key
+      - MCP_BASE_URL=${MCP_BASE_URL}
+      - APP_URL=${APP_URL:-}
+      - PUBLIC_MCP_BASE_URL=${PUBLIC_MCP_BASE_URL:-}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
+      - MODEL_OVERRIDE=${MODEL_OVERRIDE:-}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_BASE_URL=${OPENROUTER_BASE_URL:-}
+      - MEMORY_RATERS=${MEMORY_RATERS-implicit-citation,explicit-self}
+      - MEMORY_HYBRID_SEARCH=${MEMORY_HYBRID_SEARCH-1}
+      - MEMORY_GRAPH_EXPANSION=${MEMORY_GRAPH_EXPANSION-1}
+      - MEMORY_DEMOTION_FLOOR=${MEMORY_DEMOTION_FLOOR-1.0}
+      - BUSINESS_USE_API_KEY=${BUSINESS_USE_API_KEY:-}
+      - BUSINESS_USE_URL=${BUSINESS_USE_URL:-}
+      - SLACK_DISABLE=${SLACK_DISABLE:-false}
+      - SLACK_MODE=${SLACK_MODE:-socket}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN:-}
+      - SLACK_SIGNING_SECRET=${SLACK_SIGNING_SECRET:-}
+    ports:
+      - "3013:3013"
+    volumes:
+      - swarm_api_data:/app/data
+    secrets:
+      - encryption_key
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -f http://localhost:3013/health || wget -q --spider http://localhost:3013/health || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  lead:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-latest}"
+    entrypoint: *agent-entrypoint
+    platform: linux/amd64
+    pull_policy: always
+    stop_grace_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      <<: *worker-env
+      AGENT_ID: ${LEAD_AGENT_ID:-}
+      AGENT_ROLE: lead
+      TEMPLATE_ID: official/lead
+    volumes:
+      - swarm_logs:/logs
+      - swarm_shared:/workspace/shared
+      - swarm_lead:/workspace/personal
+      # AWS profile auth only: uncomment this mount. Do not expose host AWS credentials otherwise.
+      # - ${HOME}/.aws:/home/worker/.aws:ro
+    restart: unless-stopped
+
+  worker-1:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-latest}"
+    entrypoint: *agent-entrypoint
+    platform: linux/amd64
+    pull_policy: always
+    stop_grace_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      <<: *worker-env
+      AGENT_ID: ${WORKER_1_AGENT_ID:-}
+      AGENT_ROLE: worker
+      TEMPLATE_ID: official/coder
+    volumes:
+      - swarm_logs:/logs
+      - swarm_shared:/workspace/shared
+      - swarm_worker_1:/workspace/personal
+      # - ${HOME}/.aws:/home/worker/.aws:ro
+    restart: unless-stopped
+
+  worker-2:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-latest}"
+    entrypoint: *agent-entrypoint
+    platform: linux/amd64
+    pull_policy: always
+    stop_grace_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      <<: *worker-env
+      AGENT_ID: ${WORKER_2_AGENT_ID:-}
+      AGENT_ROLE: worker
+      TEMPLATE_ID: official/coder
+    volumes:
+      - swarm_logs:/logs
+      - swarm_shared:/workspace/shared
+      - swarm_worker_2:/workspace/personal
+      # - ${HOME}/.aws:/home/worker/.aws:ro
+    restart: unless-stopped
+
+  worker-researcher:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-latest}"
+    entrypoint: *agent-entrypoint
+    platform: linux/amd64
+    pull_policy: always
+    stop_grace_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      <<: *worker-env
+      AGENT_ID: ${RESEARCHER_AGENT_ID:-}
+      AGENT_ROLE: worker
+      TEMPLATE_ID: official/researcher
+    volumes:
+      - swarm_logs:/logs
+      - swarm_shared:/workspace/shared
+      - swarm_researcher:/workspace/personal
+      # - ${HOME}/.aws:/home/worker/.aws:ro
+    restart: unless-stopped
+
+secrets:
+  encryption_key:
+    file: ./encryption_key
+
+volumes:
+  agent_fs_minio:
+  agent_fs_data:
+  swarm_api_data:
+  swarm_logs:
+  swarm_shared:
+  swarm_lead:
+  swarm_worker_1:
+  swarm_worker_2:
+  swarm_researcher:
